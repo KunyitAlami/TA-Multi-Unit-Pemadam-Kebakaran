@@ -1,15 +1,27 @@
+import math
+
 import libsumo as traci
 import numpy as np
 import gymnasium as gym
 
-from .state import state, build_reward_info
+from . import tls_programs
+from .state import (
+    state,
+    build_reward_info,
+    get_green_phases,
+    get_emv_target_phases
+)
 from .reward import reward
 from .action import build_action_space, action
 
 from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-MIN_GREEN_DURATION = 5
+DECISION_INTERVAL = 5     
+MIN_GREEN_DURATION = 5    
+YELLOW_DURATION = 1.5      
+ALL_RED_DURATION = 1       
+HOLD_DURATION = 5     
 STOP_SPEED_THRESHOLD = 0.1
 
 DEMAND_FILES = {
@@ -54,35 +66,155 @@ class TrafficEnvironment(gym.Env):
         self._non_emv_depart_time = {}
         self.buat_avg_travel_time_non_upk = {}
 
-        self.remaining_duration = {
-            tl: 0
-            for tl in self.lampu_merah
-        }
+        self.original_logic = {}
+        self.original_program_id = {}
+        self.dt = 1.0
+        self.steps_per_decision = DECISION_INTERVAL
+        self.transition_log = []
+        self.transition_violations = []
+        self.transition_validation = {}
+        self._init_controller_state()
 
-        self.green_elapsed = {
-            tl: 0
-            for tl in self.lampu_merah
-        }
+    def _init_controller_state(self):
+        self.remaining_duration = {tl: 0 for tl in self.lampu_merah}
+        self.green_elapsed = {tl: 0 for tl in self.lampu_merah}
+        self.active_phase = {tl: None for tl in self.lampu_merah}
+        self.preemption_active = {tl: False for tl in self.lampu_merah}
+        self.hold_active = {tl: False for tl in self.lampu_merah}
+        self.transition_phase = {tl: None for tl in self.lampu_merah}
+        self.transition_active = {tl: False for tl in self.lampu_merah}
 
-        self.active_phase = {
-            tl: None
-            for tl in self.lampu_merah
-        }
+    def _store_original_programs(self):
+        """Simpan tlLogic asli di tls_programs (dipakai juga oleh state.py dan
+        action.py). setRedYellowGreenState() memindahkan TLS ke program 'online',
+        jadi program asli harus dipulihkan sebelum setPhase() dipakai lagi."""
+        tls_programs.store_original_programs(self.lampu_merah)
 
-        self.preemption_active = {
-            tl: False
-            for tl in self.lampu_merah
-        }
+        self.original_logic = {tl: tls_programs.get_logic(tl) for tl in self.lampu_merah}
+        self.original_program_id = {tl: tls_programs.get_program_id(tl) for tl in self.lampu_merah}
 
-        self.transition_phase = {
-            tl: None
-            for tl in self.lampu_merah
-        }
+    def _get_logic(self, tl):
+        return tls_programs.get_logic(tl)
 
-        self.transition_active = {
-            tl: False
-            for tl in self.lampu_merah
-        }
+    # ------------------------------------------------------------------
+    # Utilitas state sinyal
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _yellow_state(state_string):
+        """Hijau (G/g) -> kuning. Kuning yang sudah ada tetap kuning.
+        'u' (merah-kuning, menuju hijau) -> merah karena kita sedang meninggalkan."""
+        out = []
+        for s in state_string:
+            if s in "Gg":
+                out.append("y")
+            elif s == "u":
+                out.append("r")
+            else:
+                out.append(s)
+        return "".join(out)
+
+    @staticmethod
+    def _red_state(state_string):
+        """Semua sinyal terkontrol -> merah. 's' dan 'O'/'o' (tidak dikontrol) dibiarkan."""
+        return "".join(s if s in "sOo" else "r" for s in state_string)
+
+    def _steps_for(self, duration):
+        """Durasi (detik) dibulatkan ke atas ke kelipatan step simulasi."""
+        if duration <= 0:
+            return 0.0
+        return math.ceil(duration / self.dt - 1e-9) * self.dt
+
+    def validate_transition_setup(self):
+        """Validasi statis tiap TLS: panjang state, fase hijau tersedia, hasil
+        konversi kuning tidak memuat hijau dari SEMUA fase awal (termasuk fase
+        yang sudah kuning/merah), dan durasi sesuai step simulasi."""
+        errors = []
+        warnings = []
+        report = {}
+
+        for name, value in (("YELLOW_DURATION", YELLOW_DURATION), ("ALL_RED_DURATION", ALL_RED_DURATION)):
+            if value < 0:
+                errors.append(f"{name} tidak boleh negatif ({value})")
+            elif value > 0 and abs(self._steps_for(value) - value) > 1e-6:
+                warnings.append(
+                    f"{name}={value}s bukan kelipatan step simulasi ({self.dt}s); "
+                    f"efektif {self._steps_for(value)}s"
+                )
+
+        if abs(DECISION_INTERVAL / self.dt - round(DECISION_INTERVAL / self.dt)) > 1e-6:
+            warnings.append(
+                f"DECISION_INTERVAL={DECISION_INTERVAL}s bukan kelipatan step ({self.dt}s); "
+                f"dipakai {self.steps_per_decision} step"
+            )
+
+        for tl in self.lampu_merah:
+            phases = tls_programs.get_phase_information(tl)
+            n_signals = len(traci.trafficlight.getRedYellowGreenState(tl))
+            tl_errors = []
+
+            if not phases:
+                errors.append(f"[{tl}] tidak ada fase")
+                continue
+
+            green_idx = [p["index"] for p in phases if any(s in "Gg" for s in p["state"])]
+            starts_green = []
+            starts_yellow = []
+            starts_red = []
+
+            if not green_idx:
+                tl_errors.append("tidak ada fase hijau")
+
+            for p in phases:
+                st = p["state"]
+
+                if len(st) != n_signals:
+                    tl_errors.append(f"fase {p['index']}: panjang state {len(st)} != {n_signals}")
+                    continue
+
+                if any(s in "Gg" for s in self._yellow_state(st)):
+                    tl_errors.append(f"fase {p['index']}: konversi kuning masih memuat hijau")
+
+                if any(s in self._red_state(st) for s in "Ggyu"):
+                    tl_errors.append(f"fase {p['index']}: konversi all-red masih memuat hijau/kuning")
+
+                if any(s in "Gg" for s in st):
+                    starts_green.append(p["index"])
+                elif "y" in st:
+                    starts_yellow.append(p["index"])
+                else:
+                    starts_red.append(p["index"])
+
+            mixed = [
+                p["index"] for p in phases
+                if any(s in "Gg" for s in p["state"]) and "y" in p["state"]
+            ]
+            if mixed:
+                warnings.append(
+                    f"[{tl}] fase campuran hijau+kuning {mixed}: kuning baru memakai "
+                    f"YELLOW_DURATION, kuning yang sudah ada ikut diperpanjang"
+                )
+
+            for e in tl_errors:
+                errors.append(f"[{tl}] {e}")
+
+            report[tl] = {
+                "n_signals": n_signals,
+                "green_phases": green_idx,
+                "start_from_green": starts_green,
+                "start_from_yellow": starts_yellow,
+                "start_from_red": starts_red,
+                "errors": tl_errors,
+            }
+
+        self.transition_validation = {"per_tls": report, "warnings": warnings, "errors": errors}
+
+        for w in warnings:
+            print(f"[validasi transisi] PERINGATAN: {w}")
+
+        if errors:
+            raise RuntimeError("Validasi transisi gagal:\n  " + "\n  ".join(errors))
+
+        return self.transition_validation
 
     def spawnFireTruck(self, entry_edge, destination_edge, route_id, vehicle_id):
         route = traci.simulation.findRoute(entry_edge, destination_edge, vType="firetruck")
@@ -219,27 +351,15 @@ class TrafficEnvironment(gym.Env):
                     set()
                 ).add(incoming_lane)
 
-        programs = traci.trafficlight.getCompleteRedYellowGreenDefinition(tl)
-
         lane_phases = {
             lane: []
             for lane in incoming_lanes
         }
 
-        if not programs:
-            return lane_phases
-
-        active_program = traci.trafficlight.getProgram(tl)
-
-        selected_logic = None
-
-        for logic in programs:
-            if logic.programID == active_program:
-                selected_logic = logic
-                break
+        selected_logic = self._get_logic(tl)
 
         if selected_logic is None:
-            selected_logic = programs[0]
+            return lane_phases
 
         for phase_index, phase in enumerate(selected_logic.phases):
             phase_state = phase.state
@@ -280,64 +400,41 @@ class TrafficEnvironment(gym.Env):
         return upk_terdekat
     
     def get_phase_information(self, tl):
-        programs = traci.trafficlight.getCompleteRedYellowGreenDefinition(tl)
+        return tls_programs.get_phase_information(tl)
 
-        if not programs:
-            return []
+    def get_emv_phases(self, tl):
+        """Himpunan fase hijau (program asli) yang dibutuhkan EMV di lane masuk TLS."""
+        green_phases = get_green_phases(tl)
+        incoming_lanes = list(dict.fromkeys(traci.trafficlight.getControlledLanes(tl)))
 
-        active_program = traci.trafficlight.getProgram(tl)
+        phases_with_emv = set()
 
-        selected_logic = None
+        for lane in incoming_lanes:
+            for vehicle_id in traci.lane.getLastStepVehicleIDs(lane):
+                if traci.vehicle.getVehicleClass(vehicle_id) != "emergency":
+                    continue
 
-        for logic in programs:
-            if logic.programID == active_program:
-                selected_logic = logic
-                break
+                phases = get_emv_target_phases(vehicle_id, tl, green_phases)
+                phases_with_emv.update(phases)
 
-        if selected_logic is None:
-            selected_logic = programs[0]
+        return phases_with_emv
 
-        phase_information = []
-
-        for phase_index, phase in enumerate(selected_logic.phases):
-            phase_information.append({
-                "index": phase_index,
-                "state": phase.state,
-                "duration": phase.duration
-            })
-
-        return phase_information
-    
     def get_action_mask(self, tl):
-        action_space_tl = (self.action_space_marl[tl])
+        action_space_tl = self.action_space_marl[tl]
         mask = np.zeros(len(action_space_tl), dtype=np.float32)
         mask[0] = 1.0
 
         if self.transition_active[tl]:
             return mask
+
+        # Setelah minimum green, MAPPO bebas memilih fase lain yang dibutuhkan EMV
         if (self.preemption_active[tl] and self.green_elapsed[tl] < MIN_GREEN_DURATION):
             return mask
-        
-        lane_phase_mapping = (self.get_lane_phase_mapping(tl))
-        incoming_lanes = list(dict.fromkeys(traci.trafficlight.getControlledLanes(tl)))
-        phases_with_emv = set()
 
-        for lane in incoming_lanes:
-            vehicles = (traci.lane.getLastStepVehicleIDs(lane))
-            phases = lane_phase_mapping.get(lane, [])
+        phases_with_emv = self.get_emv_phases(tl)
 
-            for vehicle_id in vehicles:
-                try:
-                    if (traci.vehicle.getVehicleClass(vehicle_id)== "emergency"):
-                        phases_with_emv.update(phases)
-                        break
-                except Exception:
-                    continue
-
-        for action_id, phase in (action_space_tl.items()):
-            if action_id == 0:
-                continue
-            if phase in phases_with_emv:
+        for action_id, phase in action_space_tl.items():
+            if action_id != 0 and phase in phases_with_emv:
                 mask[action_id] = 1.0
 
         return mask
@@ -363,6 +460,11 @@ class TrafficEnvironment(gym.Env):
 
         traci.start(sumo_cmd)
 
+        self.dt = float(traci.simulation.getDeltaT())
+        self.steps_per_decision = max(1, int(round(DECISION_INTERVAL / self.dt)))
+        self.transition_log = []
+        self.transition_violations = []
+
         self._sumo_started = True
         self.daftar_fire_event = self.generateFireEvent()
         self.active_fire_trucks = []
@@ -381,36 +483,12 @@ class TrafficEnvironment(gym.Env):
         self._emv_entry_time = {}
         self._emv_stop_count = {}
         self._emv_prev_speed = {}
+        self._non_emv_depart_time = {}
+        self.buat_avg_travel_time_non_upk = {}
 
-        self.remaining_duration = {
-            tl: 0
-            for tl in self.lampu_merah
-        }
-
-        self.green_elapsed = {
-            tl: 0
-            for tl in self.lampu_merah
-        }
-
-        self.active_phase = {
-            tl: None
-            for tl in self.lampu_merah
-        }
-
-        self.preemption_active = {
-            tl: False
-            for tl in self.lampu_merah
-        }
-
-        self.transition_phase = {
-            tl: None
-            for tl in self.lampu_merah
-        }
-
-        self.transition_active = {
-            tl: False
-            for tl in self.lampu_merah
-        }
+        self._store_original_programs()
+        self._init_controller_state()
+        self.validate_transition_setup()
 
         self.action_space_marl = build_action_space(self.lampu_merah)
         observation = state(self.lampu_merah)
@@ -432,12 +510,9 @@ class TrafficEnvironment(gym.Env):
     def hitung_queue_length_non_upk(self, tl):
         queue_length_per_tl = 0
         incoming_lanes = list(dict.fromkeys(traci.trafficlight.getControlledLanes(tl)))
-        lane_upk = self.get_lane_upk(tl)
 
+        # Semua lane dihitung; hanya kendaraan EMV yang dikecualikan (per kendaraan)
         for lane in incoming_lanes:
-            if lane in lane_upk:
-                continue
-
             vehicles = traci.lane.getLastStepVehicleIDs(lane)
 
             for veh in vehicles:
@@ -453,11 +528,8 @@ class TrafficEnvironment(gym.Env):
         waiting_time_per_tl = 0
         incoming_lanes = list(dict.fromkeys(traci.trafficlight.getControlledLanes(tl)))
 
-        lane_upk = self.get_lane_upk(tl)
-
+        # Semua lane dihitung; hanya kendaraan EMV yang dikecualikan (per kendaraan)
         for lane in incoming_lanes:
-            if lane in lane_upk:
-                continue
             vehicles = traci.lane.getLastStepVehicleIDs(lane)
 
             for veh in vehicles:
@@ -513,90 +585,179 @@ class TrafficEnvironment(gym.Env):
             del self._emv_entry_time[key]
             del self._emv_stop_count[key]
             del self._emv_prev_speed[key]
-    
-    def execute_action(self, tl, target_phase):
+
+    # ------------------------------------------------------------------
+    # Pengendali fase: Current Green -> Yellow -> All-Red -> Target Green
+    # ------------------------------------------------------------------
+    def _activate_green(self, tl, target_phase, hold):
+        """Pulihkan program asli lalu aktifkan fase hijau target."""
+        tls_programs.restore_original_program(tl)
+
+        traci.trafficlight.setPhase(tl, target_phase)
+
+        if hold:
+            traci.trafficlight.setPhaseDuration(tl, HOLD_DURATION)
+
+        transition = self.transition_phase[tl]
+        if transition is not None:
+            self.transition_log.append({
+                "tls": tl,
+                "t_start": transition["t_start"],
+                "t_green": traci.simulation.getTime(),
+                "entry": transition["entry"],
+                "from_phase": transition["from_phase"],
+                "to_phase": target_phase,
+                "yellow_planned": transition["yellow_planned"],
+                "yellow_actual": transition["yellow_actual"],
+                "all_red_actual": transition["all_red_actual"],
+                "violations": transition["violations"],
+            })
+
+        self.active_phase[tl] = target_phase
+        self.preemption_active[tl] = True
+        self.transition_active[tl] = False
+        self.transition_phase[tl] = None
+        self.hold_active[tl] = hold
+        self.green_elapsed[tl] = 0
+
+    def execute_action(self, tl, target_phase, hold=False):
+        """Pindah ke fase hijau target dengan clearance.
+
+        hold=True: hijau dipertahankan sampai release_preemption() dipanggil
+        (dipakai Greedy). hold=False: perilaku lama (fase berjalan normal
+        setelah aktif)."""
+        phases = self.get_phase_information(tl)
+
+        if not phases:
+            raise RuntimeError(f"Tidak ada phase untuk TLS {tl}")
+
+        valid_phases = {phase["index"] for phase in phases}
+
+        if target_phase not in valid_phases:
+            raise RuntimeError(
+                f"Target phase tidak valid | TLS={tl} | "
+                f"target={target_phase} | valid={sorted(valid_phases)}"
+            )
+
+        target_state = phases[target_phase]["state"]
+        if not any(s in "Gg" for s in target_state):
+            raise RuntimeError(
+                f"Target phase bukan fase hijau | TLS={tl} | "
+                f"target={target_phase} | state={target_state}"
+            )
+
+        if self.transition_active[tl]:
+            return
+
         current_phase = traci.trafficlight.getPhase(tl)
         self.green_elapsed[tl] = 0
 
         if current_phase == target_phase:
-            self.active_phase[tl] = target_phase
-            self.preemption_active[tl] = True
-            self.transition_active[tl] = False
+            self.transition_phase[tl] = None
+            self._activate_green(tl, target_phase, hold)
             return
 
-        phases = self.get_phase_information(tl)
+        now = traci.simulation.getTime()
+        current_state = traci.trafficlight.getRedYellowGreenState(tl)
+        has_green = any(s in "Gg" for s in current_state)
+        has_yellow = "y" in current_state
 
-        if not phases:
-            raise RuntimeError(
-                f"Tidak ada phase untuk TLS {tl}"
-            )
-
-        jumlah_phase = len(phases)
-
-        valid_phases = {
-            phase["index"]
-            for phase in phases
-        }
-
-        if target_phase not in valid_phases:
-            raise RuntimeError(
-                f"Target phase tidak valid | "
-                f"TLS={tl} | "
-                f"current={current_phase} | "
-                f"target={target_phase} | "
-                f"valid={sorted(valid_phases)}"
-            )
-
-        transition_phases = []
-        phase = (current_phase + 1) % jumlah_phase
-
-        for _ in range(jumlah_phase):
-            if phase == target_phase:
-                break
-
-            transition_phases.append(phase)
-            phase = (phase + 1) % jumlah_phase
+        if has_green:
+            # Hijau -> kuning (sinyal kuning yang sudah ada ikut tetap kuning)
+            entry = "green"
+            stage = "yellow"
+            planned = self._steps_for(YELLOW_DURATION)
+            remaining = planned
+            if planned > 0:
+                traci.trafficlight.setRedYellowGreenState(tl, self._yellow_state(current_state))
+        elif has_yellow:
+            # Fase awal sudah kuning: bekukan kuning dan tunggu sisanya, jangan dipotong
+            # dan jangan biarkan program asli maju ke fase hijau lain.
+            entry = "yellow"
+            stage = "yellow"
+            planned = max(traci.trafficlight.getNextSwitch(tl) - now, 0.0)
+            remaining = planned
+            traci.trafficlight.setRedYellowGreenState(tl, self._yellow_state(current_state))
         else:
-            raise RuntimeError(
-                f"Transition phase gagal | "
-                f"TLS={tl} | "
-                f"current={current_phase} | "
-                f"target={target_phase}"
-            )
-
-        if len(transition_phases) == 0:
-            traci.trafficlight.setPhase(
-                tl,
-                target_phase
-            )
-
-            self.active_phase[tl] = target_phase
-            self.preemption_active[tl] = True
-            self.transition_active[tl] = False
-            self.green_elapsed[tl] = 0
-            return
-
-        first_phase = transition_phases[0]
-
-        self.transition_phase[tl] = {
-            "phases": transition_phases,
-            "index": 0,
-            "target_phase": target_phase,
-            "remaining_duration": phases[first_phase]["duration"]
-        }
+            entry = "red"
+            stage = "all_red"
+            planned = 0.0
+            remaining = self._steps_for(ALL_RED_DURATION)
+            traci.trafficlight.setRedYellowGreenState(tl, self._red_state(current_state))
 
         self.transition_active[tl] = True
         self.preemption_active[tl] = False
+        self.hold_active[tl] = False
 
-        traci.trafficlight.setPhase(
-            tl,
-            first_phase
-        )
+        self.transition_phase[tl] = {
+            "stage": stage,
+            "remaining": remaining,
+            "target_phase": target_phase,
+            "hold": hold,
+            "n_signals": len(current_state),
+            "entry": entry,
+            "from_phase": current_phase,
+            "t_start": now,
+            "yellow_planned": planned,
+            "yellow_actual": 0.0,
+            "all_red_actual": 0.0,
+            "violations": 0,
+        }
 
-        traci.trafficlight.setPhaseDuration(
-            tl,
-            phases[first_phase]["duration"]
-        )
+        # Tahap yang durasinya sudah 0 langsung dilewati
+        if remaining <= 1e-9:
+            self._advance_transition(tl)
+
+    def _advance_transition(self, tl):
+        """Pindah ke tahap berikutnya setelah tahap saat ini selesai."""
+        transition = self.transition_phase[tl]
+
+        if transition["stage"] == "yellow":
+            all_red = self._steps_for(ALL_RED_DURATION)
+
+            if all_red > 1e-9:
+                current_state = traci.trafficlight.getRedYellowGreenState(tl)
+                traci.trafficlight.setRedYellowGreenState(tl, self._red_state(current_state))
+                transition["stage"] = "all_red"
+                transition["remaining"] = all_red
+                return
+
+        self._activate_green(tl, transition["target_phase"], transition["hold"])
+
+    def release_preemption(self, tl):
+        """Lepas preemption. Program asli sudah aktif, jadi cukup akhiri fase
+        hijau yang di-hold agar SUMO melanjutkan siklus normal."""
+        if self.transition_active[tl]:
+            return
+
+        was_active = self.preemption_active[tl]
+
+        self.preemption_active[tl] = False
+        self.hold_active[tl] = False
+        self.active_phase[tl] = None
+        self.green_elapsed[tl] = 0
+
+        if was_active:
+            traci.trafficlight.setPhaseDuration(tl, 0)
+
+    def maintain_preemption(self, tl, needed_phases):
+        """Recovery bersama (MAPPO dan Greedy). Dipanggil di awal tiap keputusan.
+
+        Hold dipertahankan selama masih ada EMV yang membutuhkan fase hijau
+        mana pun. Jika tidak ada EMV tersisa, preemption dilepas dan program
+        asli melanjutkan siklus. Pemilihan fase lain tetap di tangan agent
+        (MAPPO lewat action mask setelah minimum green, Greedy lewat aturannya)."""
+        if self.transition_active[tl]:
+            return False
+
+        if not (self.preemption_active[tl] and self.hold_active[tl]):
+            return False
+
+        if not needed_phases:
+            self.release_preemption(tl)
+            return True
+
+        return False
 
     def simulation_step(self):
         traci.simulationStep()
@@ -604,30 +765,59 @@ class TrafficEnvironment(gym.Env):
         for tl in self.lampu_merah:
             if self.transition_active[tl]:
                 transition = self.transition_phase[tl]
-                phases = self.get_phase_information(tl)
-                transition["remaining_duration"] -= 1
 
-                if transition["remaining_duration"] <= 0:
-                    transition["index"] += 1
+                # Validasi runtime: tidak boleh ada hijau selama transisi
+                if any(s in "Gg" for s in traci.trafficlight.getRedYellowGreenState(tl)):
+                    transition["violations"] += 1
+                    self.transition_violations.append({
+                        "tls": tl,
+                        "time": traci.simulation.getTime(),
+                        "stage": transition["stage"],
+                    })
 
-                    if transition["index"] >= len(transition["phases"]):
-                        target_phase = transition["target_phase"]
-                        traci.trafficlight.setPhase(tl, target_phase)
-                        self.active_phase[tl] = target_phase
+                if transition["stage"] == "yellow":
+                    transition["yellow_actual"] += self.dt
+                else:
+                    transition["all_red_actual"] += self.dt
 
-                        self.preemption_active[tl] = True
-                        self.transition_active[tl] = False
-                        self.green_elapsed[tl] = 0
+                transition["remaining"] -= self.dt
 
+                if transition["remaining"] > 1e-9:
+                    continue
 
-                    else:
-                        next_phase = transition["phases"][transition["index"]]
-                        transition["remaining_duration"] = (phases[next_phase]["duration"])
-                        traci.trafficlight.setPhase(tl, next_phase)
-                        traci.trafficlight.setPhaseDuration(tl, phases[next_phase]["duration"])
+                self._advance_transition(tl)
 
             elif self.preemption_active[tl]:
-                self.green_elapsed[tl] += 1
+                self.green_elapsed[tl] += self.dt
+
+                if self.hold_active[tl]:
+                    traci.trafficlight.setPhaseDuration(tl, HOLD_DURATION)
+
+    def get_transition_report(self):
+        """Ringkasan validasi runtime: durasi aktual per tahap dan pelanggaran hijau."""
+        by_tls = {}
+
+        for entry in self.transition_log:
+            row = by_tls.setdefault(entry["tls"], {
+                "count": 0, "from_green": 0, "from_yellow": 0, "from_red": 0,
+                "min_yellow": None, "min_all_red": None, "violations": 0,
+            })
+            row["count"] += 1
+            row[f"from_{entry['entry']}"] += 1
+            row["violations"] += entry["violations"]
+
+            if entry["entry"] == "green":
+                y = entry["yellow_actual"]
+                row["min_yellow"] = y if row["min_yellow"] is None else min(row["min_yellow"], y)
+
+            a = entry["all_red_actual"]
+            row["min_all_red"] = a if row["min_all_red"] is None else min(row["min_all_red"], a)
+
+        return {
+            "per_tls": by_tls,
+            "total_transitions": len(self.transition_log),
+            "total_violations": len(self.transition_violations),
+        }
 
     def step(self, action_marl):
         current_time = traci.simulation.getTime()
@@ -655,6 +845,9 @@ class TrafficEnvironment(gym.Env):
                 event["status"] = True
 
         for tl in self.lampu_merah:
+            # Recovery: lepas hold jika tidak ada EMV tersisa (sama dengan Greedy)
+            self.maintain_preemption(tl, self.get_emv_phases(tl))
+
             if self.transition_active[tl]:
                 continue
 
@@ -665,10 +858,12 @@ class TrafficEnvironment(gym.Env):
             if action_id == 0:
                 continue
 
+            # Setelah minimum green, MAPPO boleh pindah ke fase lain; hold dipakai
+            # sama seperti Greedy agar hijau tidak berakhir sendiri sebelum EMV lewat.
             target_phase = action(self.action_space_marl, tl, action_id)
-            self.execute_action(tl, target_phase)
+            self.execute_action(tl, target_phase, hold=True)
 
-        for _ in range(MIN_GREEN_DURATION):
+        for _ in range(self.steps_per_decision):
             self.simulation_step()
             self.update_emv_tracking()
             self.track_non_emv_travel_time()

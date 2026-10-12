@@ -15,15 +15,26 @@ if ENV_DIR not in sys.path:
 
 import libsumo as traci
 
-from environment.env import TrafficEnvironment
-from metric_evaluation import (arrivalTimeUPK,waitingTimeUPK,queueLengthNonEMV,waitingTimeNonEMV)
+from environment.env import (
+    TrafficEnvironment,
+    DECISION_INTERVAL,
+    MIN_GREEN_DURATION,
+    YELLOW_DURATION,
+    ALL_RED_DURATION,
+)
+from metric_evaluation import (arrivalTimeUPK, waitingTimeUPK, queueLengthNonEMV, waitingTimeNonEMV)
 
 SEED = 42
 DEMAND_LEVEL = None
 JUMLAH_UNIT = None
 MAX_SIMULATION_TIME = 3600
 
-RESULT_DIR = os.path.join(PROJECT_ROOT, "hasil_evaluasi", "greedy_premption")
+# None = semua EMV di lane masuk dianggap (sama dengan action mask MAPPO).
+# Isi angka (meter) jika ingin membatasi jarak deteksi.
+DETECTION_DISTANCE = None
+
+RESULT_DIR = os.path.join(PROJECT_ROOT, "hasil_evaluasi", "greedy_preemption")
+
 
 def prepare_result_folder():
     os.makedirs(RESULT_DIR, exist_ok=True)
@@ -31,22 +42,34 @@ def prepare_result_folder():
 
 def make_result_files(start_datetime):
     timestamp = start_datetime.strftime("%Y%m%d_%H%M%S")
-    return (os.path.join(RESULT_DIR, f"greedy_premption_{timestamp}.csv"), os.path.join(RESULT_DIR, f"greedy_premption_{timestamp}.txt"))
+    return (
+        os.path.join(RESULT_DIR, f"greedy_preemption_{timestamp}.csv"),
+        os.path.join(RESULT_DIR, f"greedy_preemption_{timestamp}.txt"),
+    )
 
+
+# ----------------------------------------------------------------------
+# Spawn UPK
+# ----------------------------------------------------------------------
 def process_fire_events(env):
     current_time = traci.simulation.getTime()
+
     for event in env.daftar_fire_event:
-        if not event["status"] and current_time >= event["time_fire_event"]:
-            for i in range(event["vehicle_number"]):
-                vehicle_id = f"fire_truck_{env.counter}"
-                route_id = f"route_fire_truck_{env.counter}"
-                entry_edge = event["entry_edges"][i]
-                env.spawnFireTruck(
-                    entry_edge=entry_edge,
-                    destination_edge=event["destination_edge"],
-                    route_id=route_id,
-                    vehicle_id=vehicle_id,
-                )
+        if event["status"] or current_time < event["time_fire_event"]:
+            continue
+
+        for i in range(event["vehicle_number"]):
+            vehicle_id = f"fire_truck_{env.counter}"
+            route_id = f"route_fire_truck_{env.counter}"
+
+            spawned = env.spawnFireTruck(
+                entry_edge=event["entry_edges"][i],
+                destination_edge=event["destination_edge"],
+                route_id=route_id,
+                vehicle_id=vehicle_id,
+            )
+
+            if spawned:
                 env.active_fire_trucks.append({
                     "vehicle_id": vehicle_id,
                     "destination_edge": event["destination_edge"],
@@ -54,220 +77,164 @@ def process_fire_events(env):
                 })
                 env._eval_previous_waiting[vehicle_id] = 0.0
                 env._eval_total_waiting[vehicle_id] = 0.0
-                env.counter += 1
-            event["status"] = True
+                env._greedy_spawned += 1
 
-def build_lane_phase_mapping(tl):
+            env.counter += 1
+
+        event["status"] = True
+
+
+# ----------------------------------------------------------------------
+# Pemetaan (lane asal, edge tujuan) -> fase hijau, berbasis linkIndex
+# ----------------------------------------------------------------------
+def build_link_phase_mapping(env, tl):
+    """Kunci pemetaan = (incoming lane, outgoing edge) sehingga gerakan lurus
+    dan belok tidak tertukar. Fase hijau protected ('G') diprioritaskan;
+    'g' (permisif) hanya dipakai jika sebuah gerakan tidak punya fase 'G'."""
     controlled_links = traci.trafficlight.getControlledLinks(tl)
-    signal_to_lanes = {}
+    signal_to_keys = {}
 
     for signal_index, links in enumerate(controlled_links):
         for link in links:
             if not link:
                 continue
 
-            incoming_lane = link[0]
-            signal_to_lanes.setdefault(signal_index, set()).add(incoming_lane)
+            incoming_lane, outgoing_lane = link[0], link[1]
+            outgoing_edge = traci.lane.getEdgeID(outgoing_lane)
+            signal_to_keys.setdefault(signal_index, set()).add((incoming_lane, outgoing_edge))
 
-    controlled_lanes = list(dict.fromkeys(traci.trafficlight.getControlledLanes(tl)))
-    lane_phase_mapping = {lane: [] for lane in controlled_lanes}
-    programs = (traci.trafficlight.getCompleteRedYellowGreenDefinition(tl))
+    protected = {}
+    permissive = {}
 
-    if not programs:
-        return lane_phase_mapping
+    for phase in env.get_phase_information(tl):
+        state = phase["state"]
 
-    active_program = traci.trafficlight.getProgram(tl)
-    selected_logic = None
-
-    for logic in programs:
-        if logic.programID == active_program:
-            selected_logic = logic
-            break
-
-    if selected_logic is None:
-        selected_logic = programs[0]
-
-    for phase_index, phase in enumerate(selected_logic.phases):
-        signal_state = phase.state
-
-        for signal_index, lanes in signal_to_lanes.items():
-            if signal_index >= len(signal_state):
+        for signal_index, keys in signal_to_keys.items():
+            if signal_index >= len(state):
                 continue
 
-            signal = signal_state[signal_index]
+            symbol = state[signal_index]
 
-            if signal not in "G":
+            if symbol == "G":
+                target = protected
+            elif symbol == "g":
+                target = permissive
+            else:
                 continue
 
-            for lane in lanes:
-                if lane not in lane_phase_mapping:
-                    lane_phase_mapping[lane] = []
+            for key in keys:
+                phases = target.setdefault(key, [])
+                if phase["index"] not in phases:
+                    phases.append(phase["index"])
 
-                if phase_index not in lane_phase_mapping[lane]:
-                    lane_phase_mapping[lane].append(phase_index)
+    all_keys = set(protected) | set(permissive)
+    for keys in signal_to_keys.values():
+        all_keys |= keys
 
-    return lane_phase_mapping
+    return {key: list(protected.get(key) or permissive.get(key, [])) for key in all_keys}
 
 
-def get_upk_candidates(tl, lane_phase_mapping):
+# ----------------------------------------------------------------------
+# Kandidat EMV dan pemilihan fase
+# ----------------------------------------------------------------------
+def get_emv_candidates(env, tl):
+    mapping = env._greedy_link_phase_mapping[tl]
+    incoming_lanes = list(dict.fromkeys(traci.trafficlight.getControlledLanes(tl)))
     candidates = []
 
-    incoming_lanes = list(dict.fromkeys(traci.trafficlight.getControlledLanes(tl)))
-    vehicle_ids = set(traci.vehicle.getIDList())
-
     for lane in incoming_lanes:
-        phases = lane_phase_mapping.get(lane, [])
+        lane_length = float(traci.lane.getLength(lane))
 
-        if not phases:
-            continue
-
-        vehicles = traci.lane.getLastStepVehicleIDs(lane)
-
-        for vehicle_id in vehicles:
-            if vehicle_id not in vehicle_ids:
-                continue
-
+        for vehicle_id in traci.lane.getLastStepVehicleIDs(lane):
             try:
-                if (traci.vehicle.getVehicleClass(vehicle_id)!= "emergency"):
+                if traci.vehicle.getVehicleClass(vehicle_id) != "emergency":
                     continue
 
-                lane_position = float(traci.vehicle.getLanePosition(vehicle_id))
-                lane_length = float(traci.lane.getLength(lane))
-                distance_to_stopline = max(lane_length - lane_position,0.0)
+                route = traci.vehicle.getRoute(vehicle_id)
+                route_index = traci.vehicle.getRouteIndex(vehicle_id)
+
+                if route_index < 0 or route_index + 1 >= len(route):
+                    continue
+
+                next_edge = route[route_index + 1]
+                phases = mapping.get((lane, next_edge), [])
+
+                if not phases:
+                    continue
+
+                distance = max(lane_length - float(traci.vehicle.getLanePosition(vehicle_id)), 0.0)
+
+                if DETECTION_DISTANCE is not None and distance > DETECTION_DISTANCE:
+                    continue
 
                 candidates.append({
                     "vehicle_id": vehicle_id,
                     "lane": lane,
-                    "distance_to_stopline": distance_to_stopline,
+                    "next_edge": next_edge,
+                    "distance_to_stopline": distance,
                     "phases": list(phases),
                 })
-
             except Exception:
                 continue
 
-    candidates.sort(key=lambda item: (item["distance_to_stopline"], item["vehicle_id"],))
-
+    candidates.sort(key=lambda c: (c["distance_to_stopline"], c["vehicle_id"]))
     return candidates
 
 
-def initialize_greedy_preemption(env):
-    env._greedy_preemption_active = {
-        tl: False for tl in env.lampu_merah
-    }
+def choose_target_phase(candidates, current_phase):
+    """Greedy: layani EMV terdekat. Jika fase saat ini sudah melayaninya, tetap.
+    Jika ada beberapa pilihan fase, ambil yang melayani EMV paling banyak."""
+    nearest = candidates[0]
 
-    env._greedy_target_vehicle = {
-        tl: None for tl in env.lampu_merah
-    }
+    if current_phase in nearest["phases"]:
+        return current_phase
 
-    env._greedy_target_lane = {
-        tl: None for tl in env.lampu_merah
-    }
+    def served_count(phase):
+        return sum(1 for c in candidates if phase in c["phases"])
 
-    env._greedy_target_edge = {
-        tl: None for tl in env.lampu_merah
-    }
-
-    env._greedy_target_phase = {
-        tl: None for tl in env.lampu_merah
-    }
+    return max(nearest["phases"], key=lambda p: (served_count(p), -nearest["phases"].index(p)))
 
 
-def greedy_emv_has_passed_intersection(env, tl):
-    vehicle_id = env._greedy_target_vehicle[tl]
-    target_edge = env._greedy_target_edge[tl]
-
-    if vehicle_id is None:
-        return True
-
-    try:
-        if vehicle_id not in set(traci.vehicle.getIDList()):
-            return True
-
-        current_edge = traci.vehicle.getRoadID(vehicle_id)
-
-        if current_edge != target_edge:
-            return True
-
-        return False
-
-    except Exception:
-        return False
-
-
-def finish_greedy_preemption(env, tl):
-    env._greedy_preemption_active[tl] = False
-    env._greedy_target_vehicle[tl] = None
-    env._greedy_target_lane[tl] = None
-    env._greedy_target_edge[tl] = None
-    env._greedy_target_phase[tl] = None
-
-    env.preemption_active[tl] = False
-    env.active_phase[tl] = None
-    env.green_elapsed[tl] = 0
-
-
+# ----------------------------------------------------------------------
+# Kontrol greedy (dipanggil setiap DECISION_INTERVAL detik, seperti MAPPO)
+# ----------------------------------------------------------------------
 def apply_greedy_preemption(env):
     for tl in env.lampu_merah:
-
-        if env._greedy_preemption_active[tl]:
-
-            if greedy_emv_has_passed_intersection(env, tl):
-                finish_greedy_preemption(env, tl)
-
-            continue
-
         if env.transition_active[tl]:
             continue
 
-        target_vehicle = env._greedy_target_vehicle[tl]
-        target_phase = env._greedy_target_phase[tl]
+        candidates = get_emv_candidates(env, tl)
+        current_phase = traci.trafficlight.getPhase(tl)
 
-        if (
-            target_vehicle is not None
-            and target_phase is not None
-            and env.preemption_active[tl]
-            and traci.trafficlight.getPhase(tl) == target_phase
-        ):
-            env._greedy_preemption_active[tl] = True
+        # Recovery bersama dengan MAPPO: lepas hold jika tidak ada EMV tersisa
+        needed_phases = set()
+        for c in candidates:
+            needed_phases.update(c["phases"])
+
+        if env.maintain_preemption(tl, needed_phases):
             continue
 
-        candidates = get_upk_candidates(tl, env._greedy_lane_phase_mapping[tl])
+        if env.preemption_active[tl]:
+            # Hold selama masih ada EMV (siapa pun) yang membutuhkan fase ini
+            if any(current_phase in c["phases"] for c in candidates):
+                continue
+
+            # EMV tersisa butuh fase lain, hormati minimum green dulu
+            if env.green_elapsed[tl] < MIN_GREEN_DURATION:
+                continue
+
+            env.execute_action(tl, choose_target_phase(candidates, current_phase), hold=True)
+            continue
 
         if not candidates:
             continue
 
-        selected = candidates[0]
-        target_phases = selected["phases"]
+        env.execute_action(tl, choose_target_phase(candidates, current_phase), hold=True)
 
-        if not target_phases:
-            continue
 
-        target_phase = target_phases[0]
-        target_vehicle = selected["vehicle_id"]
-        target_lane = selected["lane"]
-
-        try:
-            target_edge = traci.lane.getEdgeID(target_lane)
-        except Exception:
-            continue
-
-        current_phase = traci.trafficlight.getPhase(tl)
-
-        env._greedy_target_vehicle[tl] = target_vehicle
-        env._greedy_target_lane[tl] = target_lane
-        env._greedy_target_edge[tl] = target_edge
-        env._greedy_target_phase[tl] = target_phase
-
-        if current_phase == target_phase:
-            env.active_phase[tl] = target_phase
-            env.preemption_active[tl] = True
-            env.transition_active[tl] = False
-            env.green_elapsed[tl] = 0
-            env._greedy_preemption_active[tl] = True
-            continue
-
-        env.execute_action(tl, target_phase)
-
+# ----------------------------------------------------------------------
+# Metrik
+# ----------------------------------------------------------------------
 def record_waiting_time_upk(env):
     vehicle_ids = set(traci.vehicle.getIDList())
 
@@ -292,21 +259,14 @@ def record_waiting_time_upk(env):
 
 
 def update_fire_trucks(env):
-    arrived_ids = set(traci.simulation.getArrivedIDList())
-    active_trucks = []
+    """Sama dengan MAPPO: arrival dicatat dan UPK dihapus saat mencapai edge tujuan."""
+    remaining = []
 
     for truck in env.active_fire_trucks:
-        vehicle_id = truck["vehicle_id"]
+        if env.updateFireTruck(truck["vehicle_id"], truck["destination_edge"], truck["waktu_spawn"]):
+            remaining.append(truck)
 
-        if vehicle_id in arrived_ids:
-            current_time = traci.simulation.getTime()
-            env.buat_avg_arrival_time_upk[vehicle_id] = current_time - truck["waktu_spawn"]
-            continue
-
-        if vehicle_id in traci.vehicle.getIDList():
-            active_trucks.append(truck)
-
-    env.active_fire_trucks = active_trucks
+    env.active_fire_trucks = remaining
 
 
 def collect_non_emv_metrics(env):
@@ -314,20 +274,14 @@ def collect_non_emv_metrics(env):
         env.buat_avg_queue_length_non_upk[tl].append(env.hitung_queue_length_non_upk(tl))
         env.buat_avg_waiting_time_non_upk[tl].append(env.hitung_waiting_time_non_upk(tl))
 
-def save_csv(filepath,
-    start,
-    end,
-    wall_time,
-    simulation_time,
-    total_steps,
-    env,
-    arrival_upk,
-    waiting_upk,
-    queue_non_emv,
-    waiting_non_emv,
-):
+
+# ----------------------------------------------------------------------
+# Penyimpanan hasil
+# ----------------------------------------------------------------------
+def save_csv(filepath, start, end, wall_time, simulation_time, total_steps, env,
+             arrival_upk, waiting_upk, queue_non_emv, waiting_non_emv):
     row = {
-        "method": "greedy_premption",
+        "method": "greedy_preemption",
         "seed": SEED,
         "demand_level": DEMAND_LEVEL,
         "jumlah_unit": JUMLAH_UNIT,
@@ -336,9 +290,13 @@ def save_csv(filepath,
         "wall_clock_seconds": wall_time,
         "simulation_time_seconds": simulation_time,
         "total_steps": total_steps,
+        "upk_spawned": env._greedy_spawned,
+        "upk_arrived": len(env.buat_avg_arrival_time_upk),
         "active_fire_trucks_at_end": len(env.active_fire_trucks),
         "arrival_time_upk": arrival_upk,
         "waiting_time_upk": waiting_upk,
+        "transition_count": env.get_transition_report()["total_transitions"],
+        "transition_green_violations": env.get_transition_report()["total_violations"],
     }
 
     for tl, value in queue_non_emv.items():
@@ -353,28 +311,21 @@ def save_csv(filepath,
         writer.writerow(row)
 
 
-def save_txt(
-    filepath,
-    start,
-    end,
-    wall_time,
-    simulation_time,
-    total_steps,
-    env,
-    arrival_upk,
-    waiting_upk,
-    queue_non_emv,
-    waiting_non_emv,
-):
+def save_txt(filepath, start, end, wall_time, simulation_time, total_steps, env,
+             arrival_upk, waiting_upk, queue_non_emv, waiting_non_emv):
+    planned = sum(e["vehicle_number"] for e in env.daftar_fire_event)
+
     with open(filepath, "w", encoding="utf-8") as f:
         f.write("=" * 80 + "\n")
         f.write("HASIL EVALUASI GREEDY PREEMPTION\n")
         f.write("=" * 80 + "\n\n")
 
         f.write("Metode              : Greedy Preemption\n")
-        f.write("Agent action        : Rule-based greedy\n")
-        f.write("Green duration      : Hold sampai EMV melewati intersection\n")
-        f.write("TLS control         : Nearest EMV + MAPPO-like phase transition\n")
+        f.write("Agent action        : Rule-based greedy (EMV terdekat, fase berbasis linkIndex)\n")
+        f.write("Green duration      : Hold selama masih ada EMV yang membutuhkan fase tersebut\n")
+        f.write(f"Transisi            : Green -> Yellow ({YELLOW_DURATION}s) -> All-Red ({ALL_RED_DURATION}s) -> Target Green\n")
+        f.write(f"Decision interval   : {DECISION_INTERVAL} detik\n")
+        f.write(f"Minimum green       : {MIN_GREEN_DURATION} detik\n")
         f.write("Waiting Time UPK    : Evaluator akumulasi getWaitingTime()\n")
         f.write(f"Seed                : {SEED}\n")
         f.write(f"Jam mulai           : {start:%Y-%m-%d %H:%M:%S}\n")
@@ -387,8 +338,9 @@ def save_txt(
         f.write("SCENARIO SUMMARY\n")
         f.write("-" * 80 + "\n")
         f.write(f"Jumlah fire event   : {len(env.daftar_fire_event)}\n")
-        f.write(f"Total UPK planned   : {sum(e['vehicle_number'] for e in env.daftar_fire_event)}\n")
-        f.write(f"Total UPK spawned   : "f"{sum(e['vehicle_number'] for e in env.daftar_fire_event)}\n\n")
+        f.write(f"Total UPK planned   : {planned}\n")
+        f.write(f"Total UPK spawned   : {env._greedy_spawned}\n")
+        f.write(f"Total UPK arrived   : {len(env.buat_avg_arrival_time_upk)}\n\n")
 
         f.write("METRIC UPK\n")
         f.write("-" * 80 + "\n")
@@ -398,7 +350,20 @@ def save_txt(
         f.write("WAITING TIME PER FIRE TRUCK\n")
         f.write("-" * 80 + "\n")
         for vehicle_id in sorted(env.buat_avg_waiting_time_upk):
-            f.write(f"{vehicle_id:<25} : "f"{env.buat_avg_waiting_time_upk[vehicle_id]:.6f} s\n")
+            f.write(f"{vehicle_id:<25} : {env.buat_avg_waiting_time_upk[vehicle_id]:.6f} s\n")
+
+        report = env.get_transition_report()
+        f.write("\nVALIDASI TRANSISI (RUNTIME)\n")
+        f.write("-" * 80 + "\n")
+        f.write(f"Total transisi      : {report['total_transitions']}\n")
+        f.write(f"Pelanggaran hijau   : {report['total_violations']}\n")
+        for tl, row in report["per_tls"].items():
+            f.write(
+                f"{tl:<22} : n={row['count']} dari_hijau={row['from_green']} "
+                f"dari_kuning={row['from_yellow']} dari_merah={row['from_red']} "
+                f"min_kuning={row['min_yellow']} min_allred={row['min_all_red']} "
+                f"pelanggaran={row['violations']}\n"
+            )
 
         f.write("\nQUEUE LENGTH NON-EMV\n")
         f.write("-" * 80 + "\n")
@@ -413,7 +378,10 @@ def save_txt(
         f.write("\n" + "=" * 80 + "\n")
 
 
-def run_greedy_premption():
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+def run_greedy_preemption():
     prepare_result_folder()
     start_datetime = datetime.now()
     wall_start = time.time()
@@ -423,15 +391,14 @@ def run_greedy_premption():
     try:
         env.reset(seed=SEED)
         env._eval_previous_waiting = {}
-        env._eval_total_waiting = {}     
-        env._greedy_lane_phase_mapping = {}
-        initialize_greedy_preemption(env)
-
-        for tl in env.lampu_merah:
-            env._greedy_lane_phase_mapping[tl] = (build_lane_phase_mapping(tl))
+        env._eval_total_waiting = {}
+        env._greedy_spawned = 0
+        env._greedy_link_phase_mapping = {
+            tl: build_link_phase_mapping(env, tl) for tl in env.lampu_merah
+        }
 
         print("\n" + "=" * 80)
-        print("GREEDY PREEMPTION BASELINE - FAIR EVALUATOR")
+        print("GREEDY PREEMPTION BASELINE")
         print("=" * 80)
         print(f"Seed         : {SEED}")
         print(f"Demand level : {DEMAND_LEVEL}")
@@ -445,58 +412,45 @@ def run_greedy_premption():
         while traci.simulation.getTime() < MAX_SIMULATION_TIME:
             process_fire_events(env)
             apply_greedy_preemption(env)
-            env.simulation_step()
-            record_waiting_time_upk(env)
-            update_fire_trucks(env)
-            collect_non_emv_metrics(env)
 
-            steps += 1
+            for _ in range(env.steps_per_decision):
+                env.simulation_step()
+                env.update_emv_tracking()
+                env.track_non_emv_travel_time()
+                record_waiting_time_upk(env)
+                update_fire_trucks(env)
+                collect_non_emv_metrics(env)
+                steps += 1
 
         end_datetime = datetime.now()
         wall_time = time.time() - wall_start
         simulation_time = traci.simulation.getTime()
 
-        env.buat_avg_waiting_time_upk = dict(env._eval_total_waiting)
+        # Hanya UPK yang tiba, sama seperti pencatatan MAPPO
+        env.buat_avg_waiting_time_upk = {
+            vid: wait for vid, wait in env._eval_total_waiting.items()
+            if vid in env.buat_avg_arrival_time_upk
+        }
+
         arrival_upk = arrivalTimeUPK(env.buat_avg_arrival_time_upk)
         waiting_upk = waitingTimeUPK(env.buat_avg_waiting_time_upk)
         queue_non_emv = queueLengthNonEMV(env.buat_avg_queue_length_non_upk)
         waiting_non_emv = waitingTimeNonEMV(env.buat_avg_waiting_time_non_upk)
         csv_path, txt_path = make_result_files(start_datetime)
 
-        save_csv(
-            csv_path,
-            start_datetime,
-            end_datetime,
-            wall_time,
-            simulation_time,
-            steps,
-            env,
-            arrival_upk,
-            waiting_upk,
-            queue_non_emv,
-            waiting_non_emv
-        )
+        args = (start_datetime, end_datetime, wall_time, simulation_time, steps, env,
+                arrival_upk, waiting_upk, queue_non_emv, waiting_non_emv)
 
-        save_txt(
-            txt_path,
-            start_datetime,
-            end_datetime,
-            wall_time,
-            simulation_time,
-            steps,
-            env,
-            arrival_upk,
-            waiting_upk,
-            queue_non_emv,
-            waiting_non_emv
-        )
+        save_csv(csv_path, *args)
+        save_txt(txt_path, *args)
 
         print("\n" + "=" * 80)
         print("GREEDY PREEMPTION SELESAI")
         print("=" * 80)
         print(f"Simulation time  : {simulation_time:.2f} s")
         print(f"Total steps      : {steps}")
-        print(f"Total UPK spawned: "f"{sum(e['vehicle_number'] for e in env.daftar_fire_event)}")
+        print(f"Total UPK spawned: {env._greedy_spawned}")
+        print(f"Total UPK arrived: {len(env.buat_avg_arrival_time_upk)}")
         print(f"Active UPK end   : {len(env.active_fire_trucks)}")
         print(f"Arrival Time UPK : {arrival_upk:.4f} s")
         print(f"Waiting Time UPK : {waiting_upk:.4f} s")
@@ -510,4 +464,4 @@ def run_greedy_premption():
 
 
 if __name__ == "__main__":
-    run_greedy_premption()
+    run_greedy_preemption()

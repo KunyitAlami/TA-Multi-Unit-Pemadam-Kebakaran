@@ -1,5 +1,6 @@
 import libsumo as traci
 import numpy as np
+from . import tls_programs
 
 MAX_GREEN_PHASES = 9
 MAX_EMV_COUNT = 5.0
@@ -11,30 +12,27 @@ MAX_REMAINING_PHASE = 60.0
 
 
 def get_green_phases(tl):
-    programs = (traci.trafficlight.getCompleteRedYellowGreenDefinition(tl))
+    # Program asli (tls_programs), konsisten dengan action.get_green_phases
+    return tls_programs.get_green_phase_indices(tl, "G")
 
-    if not programs:
-        return []
+def get_emv_target_phases(vehicle_id, tl, green_phases):
+    next_tls = traci.vehicle.getNextTLS(vehicle_id)
+    phase_states = tls_programs.get_phase_states(tl)
 
-    active_program = traci.trafficlight.getProgram(tl)
-    selected_logic = None
+    for tls_id, link_index, distance, signal_state in next_tls:
+        if tls_id != tl:
+            continue
 
-    for logic in programs:
-        if logic.programID == active_program:
-            selected_logic = logic
-            break
+        return [
+            phase_index
+            for phase_index in green_phases
+            if (
+                0 <= link_index < len(phase_states[phase_index])
+                and phase_states[phase_index][link_index] == "G"
+            )
+        ]
 
-    if selected_logic is None:
-        selected_logic = programs[0]
-
-    green_phases = []
-
-    for phase_index, phase in enumerate(selected_logic.phases):
-        if "G" in phase.state:
-            green_phases.append(phase_index)
-
-    return green_phases
-
+    return []
 
 def get_lane_phase_mapping(tl):
     incoming_lanes = list(dict.fromkeys(traci.trafficlight.getControlledLanes(tl)))
@@ -49,41 +47,20 @@ def get_lane_phase_mapping(tl):
             incoming_lane = link[0]
             signal_to_lanes.setdefault(signal_index, set()).add(incoming_lane)
 
-    programs = (traci.trafficlight.getCompleteRedYellowGreenDefinition(tl))
+    lane_phase_mapping = {lane: [] for lane in incoming_lanes}
 
-    lane_phase_mapping = {lane: []
-        for lane in incoming_lanes
-    }
+    for phase in tls_programs.get_phase_information(tl):
+        phase_index = phase["index"]
+        phase_state = phase["state"]
 
-    if not programs:
-        return lane_phase_mapping
-
-    active_program = traci.trafficlight.getProgram(tl)
-
-    selected_logic = None
-
-    for logic in programs:
-        if logic.programID == active_program:
-            selected_logic = logic
-            break
-
-    if selected_logic is None:
-        selected_logic = programs[0]
-
-    for phase_index, phase in enumerate(selected_logic.phases):
-
-        for signal_index, lanes in (signal_to_lanes.items()):
-
-            if signal_index >= len(phase.state):
+        for signal_index, lanes in signal_to_lanes.items():
+            if signal_index >= len(phase_state):
                 continue
 
-            signal = phase.state[signal_index]
-
-            if signal != "G":
+            if phase_state[signal_index] != "G":
                 continue
 
             for lane in lanes:
-
                 if lane not in lane_phase_mapping:
                     lane_phase_mapping[lane] = []
 
@@ -91,6 +68,52 @@ def get_lane_phase_mapping(tl):
                     lane_phase_mapping[lane].append(phase_index)
 
     return lane_phase_mapping
+
+# def get_phase_emv_information(tl):
+#     green_phases = get_green_phases(tl)
+
+#     phase_info = {
+#         phase: {
+#             "count": 0,
+#             "nearest_distance": MAX_DISTANCE,
+#             "waiting": 0.0,
+#         }
+#         for phase in green_phases
+#     }
+
+#     lane_phase_mapping = get_lane_phase_mapping(tl)
+#     incoming_lanes = list(dict.fromkeys(traci.trafficlight.getControlledLanes(tl)))
+
+#     for lane in incoming_lanes:
+#         phases = get_emv_target_phases(vehicle_id, tl, green_phases)
+
+#         if not phases:
+#             continue
+
+#         vehicle_ids = (traci.lane.getLastStepVehicleIDs(lane))
+#         lane_length = float(traci.lane.getLength(lane)        )
+
+#         for vehicle_id in vehicle_ids:
+#             try:
+
+#                 if (traci.vehicle.getVehicleClass(vehicle_id)!= "emergency"):
+#                     continue
+
+#                 lane_position = float(traci.vehicle.getLanePosition(vehicle_id))
+#                 distance = max(lane_length - lane_position,0.0)
+#                 waiting = float(traci.vehicle.getWaitingTime(vehicle_id))
+
+#                 for phase in phases:
+#                     if phase not in phase_info:
+#                         continue
+#                     phase_info[phase]["count"] += 1
+#                     phase_info[phase]["nearest_distance"] = min(phase_info[phase]["nearest_distance"], distance)
+#                     phase_info[phase]["waiting"] += waiting
+
+#             except Exception:
+#                 continue
+
+#     return phase_info
 
 def get_phase_emv_information(tl):
     green_phases = get_green_phases(tl)
@@ -104,40 +127,47 @@ def get_phase_emv_information(tl):
         for phase in green_phases
     }
 
-    lane_phase_mapping = get_lane_phase_mapping(tl)
-    incoming_lanes = list(dict.fromkeys(traci.trafficlight.getControlledLanes(tl)))
+    incoming_lanes = list(
+        dict.fromkeys(traci.trafficlight.getControlledLanes(tl))
+    )
 
     for lane in incoming_lanes:
-        phases = lane_phase_mapping.get(lane,[])
-
-        if not phases:
-            continue
-
-        vehicle_ids = (traci.lane.getLastStepVehicleIDs(lane))
-        lane_length = float(traci.lane.getLength(lane)        )
+        vehicle_ids = traci.lane.getLastStepVehicleIDs(lane)
+        lane_length = float(traci.lane.getLength(lane))
 
         for vehicle_id in vehicle_ids:
             try:
-
-                if (traci.vehicle.getVehicleClass(vehicle_id)!= "emergency"):
+                if traci.vehicle.getVehicleClass(vehicle_id) != "emergency":
                     continue
 
-                lane_position = float(traci.vehicle.getLanePosition(vehicle_id))
-                distance = max(lane_length - lane_position,0.0)
-                waiting = float(traci.vehicle.getWaitingTime(vehicle_id))
+                phases = get_emv_target_phases(
+                    vehicle_id, tl, green_phases
+                )
+
+                if not phases:
+                    continue
+
+                lane_position = float(
+                    traci.vehicle.getLanePosition(vehicle_id)
+                )
+
+                distance = max(lane_length - lane_position, 0.0)
+                waiting = float(
+                    traci.vehicle.getWaitingTime(vehicle_id)
+                )
 
                 for phase in phases:
-                    if phase not in phase_info:
-                        continue
                     phase_info[phase]["count"] += 1
-                    phase_info[phase]["nearest_distance"] = min(phase_info[phase]["nearest_distance"], distance)
+                    phase_info[phase]["nearest_distance"] = min(
+                        phase_info[phase]["nearest_distance"],
+                        distance
+                    )
                     phase_info[phase]["waiting"] += waiting
 
-            except Exception:
+            except traci.TraCIException:
                 continue
 
     return phase_info
-
 
 def get_non_emv_information(tl):
     queue = 0
@@ -202,7 +232,8 @@ def state(tls):
 
             state_values.extend([emv_count,nearest_distance,emv_waiting,])
 
-        current_phase = traci.trafficlight.getPhase(tl)
+        # -1 selama transisi (program 'online'), sehingga bukan dianggap fase hijau
+        current_phase = tls_programs.get_current_phase(tl)
         current_phase_one_hot = [0.0
             for _ in range(MAX_GREEN_PHASES)
         ]
@@ -218,7 +249,10 @@ def state(tls):
 
         state_values.append(is_transition)
 
-        remaining = (traci.trafficlight.getNextSwitch(tl) - traci.simulation.getTime())
+        if tls_programs.is_original_program_active(tl):
+            remaining = (traci.trafficlight.getNextSwitch(tl) - traci.simulation.getTime())
+        else:
+            remaining = 0.0
         remaining = min(max(float(remaining), 0.0), MAX_REMAINING_PHASE)
         state_values.append(remaining / MAX_REMAINING_PHASE)
 
@@ -263,6 +297,7 @@ def get_lane_traffic_info(tl, lane_phase_mapping):
 
 
 def build_upk_list(tl, lane, vehicle_ids, lane_phase_mapping, phase_aktif, current_time, emv_entry_time, emv_stop_count,):
+    green_phases = get_green_phases(tl)
     upk_list = []
     lane_length = float(traci.lane.getLength(lane))
     speed_limit = float(traci.lane.getMaxSpeed(lane))
@@ -271,6 +306,11 @@ def build_upk_list(tl, lane, vehicle_ids, lane_phase_mapping, phase_aktif, curre
     for vehicle_id in vehicle_ids:
         try:
             if (traci.vehicle.getVehicleClass(vehicle_id) != "emergency"):
+                continue
+
+            phases = get_emv_target_phases(vehicle_id, tl, green_phases)
+
+            if not phases:
                 continue
 
             lane_position = float(traci.vehicle.getLanePosition(vehicle_id))
@@ -285,7 +325,7 @@ def build_upk_list(tl, lane, vehicle_ids, lane_phase_mapping, phase_aktif, curre
 
             upk_list.append({
                 "vehicle_id": vehicle_id,
-                "phase_upk": lane_phase_mapping.get(lane, []),
+                "phase_upk": phases,
                 "phase_aktif": phase_aktif,
                 "jarak_ke_intersection": jarak_ke_intersection,
                 "jarak_ke_stopline": jarak_ke_stopline,
@@ -307,7 +347,7 @@ def build_reward_info(tls, emv_entry_time, emv_stop_count):
 
     for tl in tls:
         lane_phase_mapping = get_lane_phase_mapping(tl)
-        phase_aktif = traci.trafficlight.getPhase(tl)
+        phase_aktif = tls_programs.get_current_phase(tl)
 
         lane_traffic = get_lane_traffic_info(tl, lane_phase_mapping)
         info_lane = {}

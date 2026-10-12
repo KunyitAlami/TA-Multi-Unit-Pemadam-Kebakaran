@@ -1,36 +1,14 @@
 import libsumo as traci
+from . import tls_programs
 
 HOLD_ACTION = 0
 
 # ambil dari setiap lampu merah fase yang ada "G" (lampu hijau)
 def get_green_phases(tls):
-    green_phases = {}
-    for tl in tls:
-        programs = (traci.trafficlight.getCompleteRedYellowGreenDefinition(tl))
-
-        if not programs:
-            green_phases[tl] = []
-            continue
-
-        active_program = (traci.trafficlight.getProgram(tl))
-        selected_logic = None
-
-        for logic in programs:
-            if logic.programID == active_program:
-                selected_logic = logic
-                break
-
-        if selected_logic is None:
-            selected_logic = programs[0]
-
-        phases = []
-
-        for phase_index, phase in enumerate(selected_logic.phases):
-            if "G" in phase.state:
-                phases.append(phase_index)
-        green_phases[tl] = phases
-
-    return green_phases
+    # Selalu dari program asli (tls_programs), bukan program aktif TraCI yang bisa
+    # berubah menjadi 'online' saat transisi. Hanya fase dengan "G" (protected),
+    # supaya ukuran action space tidak berubah.
+    return {tl: tls_programs.get_green_phase_indices(tl, "G") for tl in tls}
 
 
 def build_action_space(tls):
